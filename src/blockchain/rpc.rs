@@ -50,6 +50,7 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::thread;
@@ -66,6 +67,48 @@ pub struct RpcBlockchain {
     capabilities: HashSet<Capability>,
     /// Sync parameters.
     sync_params: RpcSyncParams,
+}
+
+struct BasicBlockchainInfo {
+    height: u32,
+    network: Network,
+}
+
+// get_blockchain_info only works with very old versions of Bitcoin Core. This method
+// therefore deserializes precisely the data we need, and nothing more. 
+fn get_basic_blockchain_info(client: &Client) -> Result<BasicBlockchainInfo, Error> {
+    let raw_blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+
+    let Some(raw_obj) = raw_blockchain_info.as_object() else {
+        return Err(Error::Generic(format!(
+            "Invalid `getblockchaininfo` response: ${raw_blockchain_info}"
+        )));
+    };
+
+    let Some(raw_network) = raw_obj.get("chain").map(|value| value.as_str()).flatten() else {
+        return Err(Error::Generic(format!(
+            "Unable to find network: {raw_blockchain_info}"
+        )));
+    };
+
+    let Some(height) = raw_obj.get("blocks").map(|value| value.as_u64()).flatten() else {
+        return Err(Error::Generic(format!(
+            "Unable to find chain height: {raw_blockchain_info}"
+        )));
+    };
+
+    let network = match raw_network {
+        "main" => Network::Bitcoin,
+        "test" => Network::Testnet,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => return Err(Error::Generic(format!("Invalid network: {raw_network}"))),
+    };
+
+    Ok(BasicBlockchainInfo {
+        height: height.try_into().unwrap_or_default(),
+        network,
+    })
 }
 
 impl Deref for RpcBlockchain {
@@ -181,7 +224,8 @@ impl GetTx for RpcBlockchain {
 
 impl GetHeight for RpcBlockchain {
     fn get_height(&self) -> Result<u32, Error> {
-        Ok(self.client.get_blockchain_info().map(|i| i.blocks as u32)?)
+        let info = get_basic_blockchain_info(&self.client)?;
+        Ok(info.height)
     }
 }
 
@@ -245,19 +289,14 @@ impl ConfigurableBlockchain for RpcBlockchain {
         }
 
         let is_descriptors = is_wallet_descriptor(&client)?;
+        info!("is descriptor wallet: {is_descriptors}");
 
-        let blockchain_info = client.get_blockchain_info()?;
-        let network = match blockchain_info.chain.as_str() {
-            "main" => Network::Bitcoin,
-            "test" => Network::Testnet,
-            "regtest" => Network::Regtest,
-            "signet" => Network::Signet,
-            _ => return Err(Error::Generic("Invalid network".to_string())),
-        };
-        if network != config.network {
+        let blockchain_info = get_basic_blockchain_info(&client)?;
+
+        if blockchain_info.network != config.network {
             return Err(Error::InvalidNetwork {
                 requested: config.network,
-                found: network,
+                found: blockchain_info.network,
             });
         }
 
